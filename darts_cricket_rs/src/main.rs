@@ -1,3 +1,7 @@
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_cors::Cors;
+use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -50,25 +54,19 @@ impl DartsCricket {
             return false;
         }
 
-        // Get the current state of all players
-        let players_state: Vec<Player> = self.players.clone();
-        
-        // Update the current player's hits
         let player = &mut self.players[player_idx];
         let current_hits = player.get_hits(target);
         player.record_hit(target, hits);
 
-        // If player has closed the number (3 or more hits)
         if current_hits + hits >= 3 {
-            // Check if other players haven't closed this number
-            let other_players_closed = players_state.iter()
+            let other_players_closed = self.players.iter()
                 .enumerate()
                 .filter(|&(idx, _)| idx != player_idx)
                 .all(|(_, p)| p.is_number_closed(target));
             
             if !other_players_closed {
                 let points = (current_hits + hits - 2) * target;
-                player.score += points;
+                self.players[player_idx].score += points;
             }
         }
 
@@ -83,23 +81,48 @@ impl DartsCricket {
         self.players.get(player_idx).map_or(0, |p| p.get_hits(target))
     }
 
-    fn display_status(&self) {
-        println!("\nCurrent Game Status:");
-        for (idx, player) in self.players.iter().enumerate() {
-            println!("\nPlayer {}:", idx + 1);
-            println!("Score: {}", player.score);
-            println!("Hits:");
-            for &target in TARGETS.iter() {
-                let hits = player.get_hits(target);
-                let status = if hits >= 3 {
-                    "Closed".to_string()
-                } else {
-                    format!("{}/3", hits)
-                };
-                println!("{}: {}", target, status);
-            }
-        }
+    fn get_game_status(&self) -> GameStatus {
+        let players = (0..self.players.len()).collect();
+        let scores = self.players.iter().map(|p| p.score).collect();
+        let hits = self.players.iter()
+            .map(|p| TARGETS.iter().map(|&t| p.get_hits(t)).collect())
+            .collect();
+        
+        GameStatus { players, scores, hits }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct GameStatus {
+    players: Vec<usize>,
+    scores: Vec<u32>,
+    hits: Vec<Vec<u32>>,
+}
+
+#[derive(Deserialize)]
+struct HitRequest {
+    player_idx: usize,
+    target: u32,
+    hits: u32,
+}
+
+struct AppState {
+    game: Mutex<DartsCricket>,
+}
+
+async fn record_hit(
+    data: web::Data<AppState>,
+    hit: web::Json<HitRequest>,
+) -> impl Responder {
+    let mut game = data.game.lock().unwrap();
+    let success = game.record_hit(hit.player_idx, hit.target, hit.hits);
+    HttpResponse::Ok().json(serde_json::json!({ "success": success }))
+}
+
+async fn get_status(data: web::Data<AppState>) -> impl Responder {
+    let game = data.game.lock().unwrap();
+    let status = game.get_game_status();
+    HttpResponse::Ok().json(status)
 }
 
 fn get_input<T: std::str::FromStr>(prompt: &str) -> T {
@@ -115,50 +138,29 @@ fn get_input<T: std::str::FromStr>(prompt: &str) -> T {
     }
 }
 
-fn main() {
-    println!("Welcome to Darts Cricket!");
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let game = DartsCricket::new(2);
+    let app_state = web::Data::new(AppState {
+        game: Mutex::new(game),
+    });
 
-    // Get number of players
-    let num_players: usize = loop {
-        let input: usize = get_input("Enter number of players (max 10): ");
-        if (1..=10).contains(&input) {
-            break input;
-        }
-        println!("Please enter a number between 1 and 10.");
-    };
+    println!("Starting server at http://localhost:8080");
 
-    let mut game = DartsCricket::new(num_players);
+    HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .max_age(3600);
 
-    // Game loop
-    loop {
-        game.display_status();
-
-        let player: usize = get_input(&format!("\nEnter player number (1-{}) or 0 to quit: ", num_players));
-        if player == 0 {
-            break;
-        }
-        if !(1..=num_players).contains(&player) {
-            println!("Invalid player number.");
-            continue;
-        }
-
-        let target: u32 = get_input("Enter target number (15-20, 25 for bullseye): ");
-        if !TARGETS.contains(&target) {
-            println!("Invalid target number.");
-            continue;
-        }
-
-        let hits: u32 = get_input("Enter number of hits (1-3): ");
-        if !(1..=3).contains(&hits) {
-            println!("Invalid number of hits.");
-            continue;
-        }
-
-        game.record_hit(player - 1, target, hits);
-    }
-
-    println!("\nFinal Scores:");
-    for (idx, player) in game.players.iter().enumerate() {
-        println!("Player {}: {}", idx + 1, player.score);
-    }
+        App::new()
+            .wrap(cors)
+            .app_data(app_state.clone())
+            .route("/status", web::get().to(get_status))
+            .route("/hit", web::post().to(record_hit))
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await
 }
